@@ -1,0 +1,22 @@
+syntax = "proto3";
+package mpvcast.control;
+
+message Control {
+  enum Action {
+    STOP = 0;
+    PAUSE = 1;
+    START = 2;
+    SEEK = 3;
+    VOLUME = 4;
+    LOAD = 5;
+  }
+  enum Units {
+    NONE = 0;
+    SECONDS = 2;
+  }
+
+  Action action = 1;
+  optional int64 amount = 2;
+  optional Units unit = 3;
+  optional string path = 4;
+}

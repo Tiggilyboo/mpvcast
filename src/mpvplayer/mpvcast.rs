@@ -4,7 +4,7 @@ pub mod mpvcast {
     }
 }
 
-use control::{Action, Units};
+pub use control::{Action, Units};
 pub use mpvcast::control::*;
 
 fn create_request(

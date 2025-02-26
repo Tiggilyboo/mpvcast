@@ -1,11 +1,12 @@
-pub mod mpvcast {
+pub mod comms {
     pub mod control {
-        include!(concat!(env!("OUT_DIR"), "/mpvcast.control.rs"));
+        include!(concat!(env!("OUT_DIR"), "/mpvcast.comms.rs"));
     }
 }
 
-pub use control::{Action, Units};
-pub use mpvcast::control::*;
+pub use comms::control::*;
+pub use control::*;
+pub use prost::Message;
 
 fn create_request(
     action: Action,

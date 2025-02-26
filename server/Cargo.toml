@@ -4,11 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libmpv = { path = "./libmpv-rs" }
-prost = "0.13"
+comms = { path = "../comms" }
+libmpv = { path = "../libmpv-rs" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 async-std = { version = "1.13", features = ["attributes", "std"] }
 
-[build-dependencies]
-prost-build = "0.13.5"

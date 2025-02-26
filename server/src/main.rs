@@ -50,13 +50,13 @@ async fn execute() -> Result<()> {
     if !daemon {
         if let Ok(player) = player.write() {
             if let Some(source) = source {
-                let loaded = player.queue_request(Request::load(source)).await;
+                let loaded = player.queue_request(comms::Request::load(source)).await;
                 if !loaded {
                     return Err(anyhow!("Unable to queue load request"));
                 }
                 if let Some(at) = at {
                     let seek = player
-                        .queue_request(Request::seek(at, control::Units::Seconds))
+                        .queue_request(comms::Request::seek(at, comms::Units::Seconds))
                         .await;
                     if !seek {
                         return Err(anyhow!("Unable to queue seek request"));
@@ -64,7 +64,9 @@ async fn execute() -> Result<()> {
                 }
 
                 if let Some(volume) = volume {
-                    let volume = player.queue_request(Request::volume(volume as i64)).await;
+                    let volume = player
+                        .queue_request(comms::Request::volume(volume as i64))
+                        .await;
                     if !volume {
                         return Err(anyhow!("Unable to queue volume request"));
                     }

@@ -2,12 +2,12 @@ use std::io::Result;
 
 fn main() -> Result<()> {
     let mut protos = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("./src/proto") {
+    if let Ok(entries) = std::fs::read_dir("./src") {
         for entry in entries {
             match entry {
                 Ok(entry) => {
-                    println!("Found {:?}", entry.path());
                     if entry.path().extension().is_some_and(|ext| ext == "proto") {
+                        println!("Found {:?}", entry.path());
                         protos.push(entry.path())
                     }
                 }
@@ -15,6 +15,8 @@ fn main() -> Result<()> {
             }
         }
     }
+    println!("Building: {:?}", protos);
+
     prost_build::compile_protos(&protos, &["src/"])?;
 
     Ok(())

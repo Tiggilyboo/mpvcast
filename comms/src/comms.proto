@@ -1,5 +1,5 @@
 syntax = "proto3";
-package mpvcast.control;
+package mpvcast.comms;
 
 message Control {
   enum Action {

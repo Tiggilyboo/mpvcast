@@ -1,10 +1,7 @@
-pub mod mpvcast;
-use prost::Message;
-
+use async_std::channel::Sender;
 use async_std::net::{TcpListener, TcpStream};
 use async_std::prelude::*;
-pub use control::Action;
-pub use mpvcast::*;
+use comms::Message;
 
 use std::{
     collections::HashMap,
@@ -37,7 +34,7 @@ impl MpvProperty {
 pub struct MpvPlayer {
     mpv: Arc<Mpv>,
     state: RwLock<MpvPlayerState>,
-    tx: async_std::channel::Sender<Request>,
+    tx: Sender<comms::Request>,
     daemon: bool,
 }
 
@@ -70,6 +67,7 @@ impl MpvPlayer {
             volume: 0,
         });
         let (tx, rx) = async_std::channel::bounded(256);
+        let tx_clone = Arc::new(tx.clone());
         let mpv_player = Arc::new(RwLock::new(Self {
             mpv,
             state,
@@ -86,50 +84,49 @@ impl MpvPlayer {
             }
         });
 
+        let connection_string = format!("0.0.0.0:{}", TCP_PORT);
+        println!("Starting server at {}", connection_string);
         async_std::task::spawn(async move {
-            let connection_string = format!("0.0.0.0:{}", TCP_PORT);
-            println!("Starting server at {}", connection_string);
-
             let listener = TcpListener::bind(connection_string).await;
             if let Err(e) = listener {
-                println!("Error binding to port 8008: {:?}", e);
-                return;
+                return Err(anyhow!(e.to_string()));
             }
             let listener = listener.unwrap();
-            let mut incoming = listener.incoming();
 
-            while let Some(stream) = incoming.next().await {
+            while let Some(stream) = listener.incoming().next().await {
                 match stream {
                     Ok(stream) => {
-                        Self::handle_client(stream).await;
+                        if let Err(e) = Self::handle_client_requests(stream, tx_clone.clone()).await
+                        {
+                            return Err(anyhow!(e.to_string()));
+                        }
                     }
-                    Err(e) => {
-                        println!("Error establishing connection: {:?}", e);
-                        break;
-                    }
+                    Err(e) => return Err(anyhow!(e.to_string())),
                 }
             }
+
+            Ok(())
         });
 
         Ok(mpv_player)
     }
 
-    fn process_request(&self, request: Request) {
+    fn process_request(&self, request: comms::Request) {
         println!("process_request: {:?}", request);
 
         let result = match request.action() {
-            Action::Load => self.load_video(request.path()),
-            Action::Stop => self.stop(),
-            Action::Pause => self.pause(),
-            Action::Start => self.play(),
-            Action::Volume => self.set_volume(request.amount()),
-            Action::Seek => {
+            comms::Action::Load => self.load_video(request.path()),
+            comms::Action::Stop => self.stop(),
+            comms::Action::Pause => self.pause(),
+            comms::Action::Start => self.play(),
+            comms::Action::Volume => self.set_volume(request.amount()),
+            comms::Action::Seek => {
                 let (seek_time, rewind) = match request.unit() {
-                    control::Units::Seconds => (
+                    comms::Units::Seconds => (
                         Duration::from_secs(request.amount().abs() as u64),
                         request.amount() < 0,
                     ),
-                    control::Units::None => (Duration::ZERO, false),
+                    comms::Units::None => (Duration::ZERO, false),
                 };
                 if !seek_time.is_zero() {
                     self.set_seek(seek_time, rewind)
@@ -145,7 +142,10 @@ impl MpvPlayer {
         }
     }
 
-    async fn handle_client(mut stream: TcpStream) {
+    async fn handle_client_requests(
+        mut stream: TcpStream,
+        tx: Arc<async_std::channel::Sender<comms::Request>>,
+    ) -> Result<(), anyhow::Error> {
         println!("New client connecting");
 
         let mut buf = vec![0u8; 1024];
@@ -156,16 +156,20 @@ impl MpvPlayer {
                     println!("Client disconnected");
                     break;
                 }
-                Ok(n) => match Request::decode(&buf[..n]) {
-                    Ok(request) => println!("Received request: {:?}", request),
-                    Err(e) => println!("Failed to decode protobuf: {}", e),
+                Ok(n) => match comms::Request::decode(&buf[..n]) {
+                    Ok(request) => {
+                        println!("Received request: {:?}", request);
+                        if let Err(e) = tx.send(request).await {
+                            return Err(anyhow!(e.to_string()));
+                        }
+                    }
+                    Err(e) => return Err(anyhow!(e.to_string())),
                 },
-                Err(e) => {
-                    println!("Failed to read from socket: {}", e);
-                    break;
-                }
+                Err(e) => return Err(anyhow!(e.to_string())),
             }
         }
+
+        return Ok(());
     }
 
     fn set_property<T>(&self, property: MpvProperty, value: T) -> Result<()>
@@ -240,7 +244,7 @@ impl MpvPlayer {
         }
     }
 
-    pub async fn queue_request(&self, request: Request) -> bool {
+    pub async fn queue_request(&self, request: comms::Request) -> bool {
         if let Ok(_) = self.tx.send(request).await {
             true
         } else {

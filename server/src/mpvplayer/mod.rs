@@ -1,6 +1,8 @@
-use async_std::channel::Sender;
+use async_std::channel::{Receiver, Sender};
+use async_std::io::BufReader;
 use async_std::net::{TcpListener, TcpStream};
 use async_std::prelude::*;
+use async_std::sync::Mutex;
 use comms::Message;
 
 use std::{
@@ -34,8 +36,8 @@ impl MpvProperty {
 pub struct MpvPlayer {
     mpv: Arc<Mpv>,
     state: RwLock<MpvPlayerState>,
-    tx: Sender<comms::Request>,
-    daemon: bool,
+    request_rx: Receiver<comms::Request>,
+    response_tx: Sender<comms::Response>,
 }
 
 #[derive(Debug)]
@@ -56,7 +58,7 @@ pub enum PlayerState {
 }
 
 impl MpvPlayer {
-    pub async fn new(daemon: bool) -> Result<Arc<RwLock<Self>>> {
+    pub async fn new() -> Result<Self> {
         let mpv: Arc<Mpv>;
         match Mpv::new() {
             Ok(data) => mpv = Arc::new(data),
@@ -66,43 +68,45 @@ impl MpvPlayer {
             state: PlayerState::Idle,
             volume: 0,
         });
-        let (tx, rx) = async_std::channel::bounded(256);
-        let tx_clone = Arc::new(tx.clone());
-        let mpv_player = Arc::new(RwLock::new(Self {
+        let (request_tx, request_rx) = async_std::channel::unbounded::<comms::Request>();
+        let (response_tx, response_rx) = async_std::channel::unbounded::<comms::Response>();
+        let mpv_player = Self {
             mpv,
             state,
-            tx,
-            daemon,
-        }));
-
-        let player_clone = Arc::clone(&mpv_player);
-        async_std::task::spawn(async move {
-            while let Ok(request) = rx.recv().await {
-                if let Ok(mpv_player) = player_clone.write() {
-                    mpv_player.process_request(request);
-                }
-            }
-        });
+            request_rx,
+            response_tx,
+        };
+        let response_rx = Arc::new(Mutex::new(response_rx));
 
         let connection_string = format!("0.0.0.0:{}", TCP_PORT);
         println!("Starting server at {}", connection_string);
         async_std::task::spawn(async move {
-            let listener = TcpListener::bind(connection_string).await;
-            if let Err(e) = listener {
-                return Err(anyhow!(e.to_string()));
-            }
-            let listener = listener.unwrap();
-
-            while let Some(stream) = listener.incoming().next().await {
-                match stream {
-                    Ok(stream) => {
-                        if let Err(e) = Self::handle_client_requests(stream, tx_clone.clone()).await
-                        {
-                            return Err(anyhow!(e.to_string()));
-                        }
-                    }
-                    Err(e) => return Err(anyhow!(e.to_string())),
+            let mut attempts = 0;
+            loop {
+                let listener = TcpListener::bind(&connection_string).await;
+                if let Err(e) = listener {
+                    return Err(anyhow!(e.to_string()));
                 }
+                let listener = listener.unwrap();
+
+                while let Ok((stream, _)) = listener.accept().await {
+                    // Success, restart attempt count
+                    attempts = 0;
+
+                    let stream = Arc::new(Mutex::new(stream));
+                    async_std::task::spawn(receive_requests(stream.clone(), request_tx.clone()));
+
+                    // Start task handler which forwards responses to stream
+                    let stream_response_rx = Arc::clone(&response_rx);
+                    async_std::task::spawn(send_response(stream, stream_response_rx));
+                }
+
+                println!("Connection lost, restarting server... {}", attempts);
+                if attempts > 5 {
+                    break;
+                }
+
+                attempts += 1;
             }
 
             Ok(())
@@ -140,36 +144,6 @@ impl MpvPlayer {
             Ok(_) => (),
             Err(e) => println!("Unable to process request: {:?}", e),
         }
-    }
-
-    async fn handle_client_requests(
-        mut stream: TcpStream,
-        tx: Arc<async_std::channel::Sender<comms::Request>>,
-    ) -> Result<(), anyhow::Error> {
-        println!("New client connecting");
-
-        let mut buf = vec![0u8; 1024];
-
-        loop {
-            match stream.read(&mut buf).await {
-                Ok(0) => {
-                    println!("Client disconnected");
-                    break;
-                }
-                Ok(n) => match comms::Request::decode(&buf[..n]) {
-                    Ok(request) => {
-                        println!("Received request: {:?}", request);
-                        if let Err(e) = tx.send(request).await {
-                            return Err(anyhow!(e.to_string()));
-                        }
-                    }
-                    Err(e) => return Err(anyhow!(e.to_string())),
-                },
-                Err(e) => return Err(anyhow!(e.to_string())),
-            }
-        }
-
-        return Ok(());
     }
 
     fn set_property<T>(&self, property: MpvProperty, value: T) -> Result<()>
@@ -244,14 +218,6 @@ impl MpvPlayer {
         }
     }
 
-    pub async fn queue_request(&self, request: comms::Request) -> bool {
-        if let Ok(_) = self.tx.send(request).await {
-            true
-        } else {
-            false
-        }
-    }
-
     fn load_video(&self, url_or_path: &str) -> Result<()> {
         if self.mpv.playlist_clear().is_err() {
             bail!("Unable to clear playlist")
@@ -294,13 +260,8 @@ impl MpvPlayer {
             if let Some(ev) = ev_ctx.wait_event(1000.) {
                 match ev {
                     Ok(Event::EndFile(r)) => {
-                        if self.daemon {
-                            println!("Idle, stream ended: {:?}", r);
-                            self.set_player_state(PlayerState::Idle);
-                        } else {
-                            println!("Exiting, stream ended: {:?}", r);
-                            self.set_player_state(PlayerState::Exiting);
-                        }
+                        println!("Idle, stream ended: {:?}", r);
+                        self.set_player_state(PlayerState::Idle);
                         break;
                     }
                     Ok(Event::PropertyChange { name, .. })
@@ -350,4 +311,67 @@ fn seekable_ranges(demuxer_cache_state: &MpvNode) -> Option<Vec<(f64, f64)>> {
     }
 
     Some(res)
+}
+
+async fn send_response(
+    stream: Arc<Mutex<TcpStream>>,
+    response_rx: Arc<Mutex<async_std::channel::Receiver<comms::Response>>>,
+) {
+    let response_rx = response_rx.lock().await;
+    loop {
+        match response_rx.recv().await {
+            Ok(response) => {
+                let encoded_data = response.encode_to_vec();
+                let mut stream = stream.lock().await;
+                if let Err(e) = stream.write_all(&encoded_data).await {
+                    eprintln!("Error sending response to client: {}", e);
+                    continue;
+                }
+            }
+            Err(e) => {
+                eprintln!("Error receiving response to send to client: {}", e);
+                break;
+            }
+        }
+    }
+
+    println!("Response rx channel EOF");
+}
+
+async fn receive_requests(
+    stream: Arc<Mutex<TcpStream>>,
+    request_tx: async_std::channel::Sender<comms::Request>,
+) {
+    println!("New client connecting");
+
+    let mut buf_reader = BufReader::new(stream.lock().await.clone());
+    let mut buf = vec![0u8; 1024];
+
+    loop {
+        match buf_reader.read(&mut buf).await {
+            Ok(0) => {
+                println!("Client disconnected");
+                break;
+            }
+            Ok(n) => match comms::Request::decode(&buf[..n]) {
+                Ok(request) => {
+                    println!("Received request: {:?}", request);
+                    if let Err(e) = request_tx.send(request).await {
+                        eprintln!("Unable to send request to handler: {}", e);
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Unable to decode request: {:?}", e);
+                    continue;
+                }
+            },
+            Err(e) => {
+                eprintln!("Error reading from stream: {:?}", e);
+                break;
+            }
+        }
+    }
+
+    println!("Client connection EOF");
 }

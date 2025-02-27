@@ -9,12 +9,14 @@ pub use control::*;
 pub use prost::Message;
 
 fn create_request(
+    id: u32,
     action: Action,
     amount: Option<i64>,
     unit: Option<Units>,
     path: Option<String>,
 ) -> Control {
     Control {
+        id,
         action: action as i32,
         amount,
         path,
@@ -24,44 +26,29 @@ fn create_request(
 
 pub type Request = Control;
 
-static CONTROL_STOP: Control = Control {
-    action: Action::Stop as i32,
-    amount: None,
-    path: None,
-    unit: None,
-};
-
-static CONTROL_PAUSE: Control = Control {
-    action: Action::Pause as i32,
-    amount: None,
-    path: None,
-    unit: None,
-};
-
-static CONTROL_START: Control = Control {
-    action: Action::Start as i32,
-    amount: None,
-    path: None,
-    unit: None,
-};
-
 impl Request {
-    pub fn stop() -> &'static Control {
-        &CONTROL_STOP
+    pub fn stop(id: u32) -> Control {
+        create_request(id, Action::Stop, None, None, None)
     }
-    pub fn start() -> &'static Control {
-        &CONTROL_START
+    pub fn start(id: u32) -> Control {
+        create_request(id, Action::Start, None, None, None)
     }
-    pub fn pause() -> &'static Control {
-        &CONTROL_PAUSE
+    pub fn pause(id: u32) -> Control {
+        create_request(id, Action::Pause, None, None, None)
     }
-    pub fn seek(seek: std::time::Duration, units: Units) -> Control {
-        create_request(Action::Seek, Some(seek.as_secs() as i64), Some(units), None)
+    pub fn seek(id: u32, seek: std::time::Duration, units: Units) -> Control {
+        create_request(
+            id,
+            Action::Seek,
+            Some(seek.as_secs() as i64),
+            Some(units),
+            None,
+        )
     }
-    pub fn volume(volume: i64) -> Control {
-        create_request(Action::Volume, Some(volume as i64), None, None)
+    pub fn volume(id: u32, volume: i64) -> Control {
+        create_request(id, Action::Volume, Some(volume as i64), None, None)
     }
-    pub fn load(path: String) -> Control {
-        create_request(Action::Load, None, None, Some(path))
+    pub fn load(id: u32, path: String) -> Control {
+        create_request(id, Action::Load, None, None, Some(path))
     }
 }

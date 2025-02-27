@@ -15,8 +15,21 @@ message Control {
     SECONDS = 2;
   }
 
-  Action action = 1;
-  optional int64 amount = 2;
-  optional Units unit = 3;
-  optional string path = 4;
+  uint32 id = 1;
+  Action action = 2;
+  optional int64 amount = 3;
+  optional Units unit = 4;
+  optional string path = 5;
+}
+
+message Response {
+  enum Status {
+    SUCCESS = 0;
+    FAILURE = 1;
+    ERROR = 2;
+  }
+
+  uint32 request_id = 1;
+  Status status = 2;
+  optional string message = 3;
 }

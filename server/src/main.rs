@@ -1,26 +1,11 @@
 pub mod mpvplayer;
 use anyhow::Result;
-use std::{process::ExitCode, time::Duration};
+use std::process::ExitCode;
 
 use mpvplayer::*;
 
 async fn execute() -> Result<()> {
-    let player = MpvPlayer::new().await?;
-
-    // Wait until the player has exited
-    loop {
-        match player.player_state() {
-            PlayerState::Exiting => {
-                println!("Player exiting");
-                break;
-            }
-            _ => (),
-        }
-
-        async_std::task::sleep(Duration::from_millis(500)).await;
-    }
-
-    Ok(())
+    MpvPlayer::serve().await
 }
 
 #[async_std::main]

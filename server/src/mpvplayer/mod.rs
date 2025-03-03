@@ -1,17 +1,19 @@
-use async_std::channel::{Receiver, Sender};
-use async_std::io::BufReader;
+use async_std::channel::Sender;
+use async_std::io::WriteExt;
 use async_std::net::{TcpListener, TcpStream};
 use async_std::prelude::*;
 use async_std::sync::Mutex;
 use comms::Message;
-
+use std::collections::HashSet;
+use std::path::Path;
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
     time::{self, Duration},
 };
+use url::Url;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use events::*;
 use libmpv::*;
 
@@ -36,8 +38,8 @@ impl MpvProperty {
 pub struct MpvPlayer {
     mpv: Arc<Mpv>,
     state: RwLock<MpvPlayerState>,
-    request_rx: Receiver<comms::Request>,
     response_tx: Sender<comms::Response>,
+    supported_fe: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -58,7 +60,7 @@ pub enum PlayerState {
 }
 
 impl MpvPlayer {
-    pub async fn new() -> Result<Self> {
+    pub async fn serve() -> Result<()> {
         let mpv: Arc<Mpv>;
         match Mpv::new() {
             Ok(data) => mpv = Arc::new(data),
@@ -68,14 +70,36 @@ impl MpvPlayer {
             state: PlayerState::Idle,
             volume: 0,
         });
+        let ffmpeg_format_output = std::process::Command::new("ffmpeg")
+            .arg("-formats")
+            .output()
+            .map_err(|e| anyhow!(e.to_string()))?;
+
+        let supported_fe = String::from_utf8_lossy(&ffmpeg_format_output.stdout)
+            .lines()
+            .filter_map(|l| {
+                let start = l.trim_start();
+                if start.starts_with("DE") || start.starts_with("D ") {
+                    start
+                        .split_whitespace()
+                        .nth(1)
+                        .map(|s| s.to_lowercase().split(',').collect())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        println!("Supported media formats: {:?}", &supported_fe);
+
         let (request_tx, request_rx) = async_std::channel::unbounded::<comms::Request>();
         let (response_tx, response_rx) = async_std::channel::unbounded::<comms::Response>();
-        let mpv_player = Self {
+        let mpv_player = Arc::new(Mutex::new(Self {
             mpv,
             state,
-            request_rx,
             response_tx,
-        };
+            supported_fe,
+        }));
         let response_rx = Arc::new(Mutex::new(response_rx));
 
         let connection_string = format!("0.0.0.0:{}", TCP_PORT);
@@ -93,12 +117,12 @@ impl MpvPlayer {
                     // Success, restart attempt count
                     attempts = 0;
 
-                    let stream = Arc::new(Mutex::new(stream));
-                    async_std::task::spawn(receive_requests(stream.clone(), request_tx.clone()));
+                    let stream_clone = stream.clone();
+                    async_std::task::spawn(receive_requests(stream_clone, request_tx.clone()));
 
                     // Start task handler which forwards responses to stream
                     let stream_response_rx = Arc::clone(&response_rx);
-                    async_std::task::spawn(send_response(stream, stream_response_rx));
+                    async_std::task::spawn(send_responses(stream, stream_response_rx));
                 }
 
                 println!("Connection lost, restarting server... {}", attempts);
@@ -112,18 +136,45 @@ impl MpvPlayer {
             Ok(())
         });
 
-        Ok(mpv_player)
+        let mpv_player_cloned = mpv_player.clone();
+        async_std::task::spawn(async move {
+            while let Ok(request) = request_rx.recv().await {
+                let locked_player = mpv_player.lock().await;
+                let response = locked_player.process_request(&request);
+                println!("Processed response {:?} -> {:?}", &request, &response);
+                if let Err(e) = locked_player.response_tx.send(response).await {
+                    eprintln!("unable to send response in channel: {:?}", e);
+                }
+            }
+        });
+
+        // Wait until the player has exited
+        loop {
+            let mpv_player = mpv_player_cloned.lock().await;
+            match mpv_player.player_state() {
+                PlayerState::Exiting => {
+                    println!("Player exiting");
+                    break;
+                }
+                _ => (),
+            }
+
+            async_std::task::sleep(Duration::from_millis(500)).await;
+        }
+
+        Ok(())
     }
 
-    fn process_request(&self, request: comms::Request) {
+    fn process_request(&self, request: &comms::Request) -> comms::Response {
         println!("process_request: {:?}", request);
 
-        let result = match request.action() {
-            comms::Action::Load => self.load_video(request.path()),
-            comms::Action::Stop => self.stop(),
-            comms::Action::Pause => self.pause(),
-            comms::Action::Start => self.play(),
-            comms::Action::Volume => self.set_volume(request.amount()),
+        match request.action() {
+            comms::Action::Browse => self.browse(request),
+            comms::Action::Load => self.load_video(request),
+            comms::Action::Stop => self.stop(request),
+            comms::Action::Pause => self.pause(request),
+            comms::Action::Start => self.play(request),
+            comms::Action::Volume => self.set_volume(request),
             comms::Action::Seek => {
                 let (seek_time, rewind) = match request.unit() {
                     comms::Units::Seconds => (
@@ -133,16 +184,11 @@ impl MpvPlayer {
                     comms::Units::None => (Duration::ZERO, false),
                 };
                 if !seek_time.is_zero() {
-                    self.set_seek(seek_time, rewind)
+                    self.set_seek(request, seek_time, rewind)
                 } else {
-                    Ok(())
+                    comms::Response::success(request)
                 }
             }
-        };
-
-        match result {
-            Ok(_) => (),
-            Err(e) => println!("Unable to process request: {:?}", e),
         }
     }
 
@@ -160,20 +206,30 @@ impl MpvPlayer {
         }
     }
 
-    fn set_volume(&self, volume: i64) -> Result<()> {
+    fn set_volume(&self, request: &comms::Request) -> comms::Response {
+        let volume = request.amount();
         if let Err(e) = self.set_property(MpvProperty::Volume, volume) {
-            return Err(e);
-        }
-        if let Ok(mut state) = self.state.write() {
-            state.volume = volume;
-        } else {
-            return Err(anyhow!("Unable to set volume: Cannot lock state"));
+            return comms::Response::error(request, e.to_string());
         }
 
-        Ok(())
+        match self.state.write() {
+            Ok(mut state) => {
+                state.volume = volume;
+                comms::Response::success(request)
+            }
+            Err(e) => comms::Response::error(
+                request,
+                format!("Unable to set state for volume: {:?}", e.to_string()),
+            ),
+        }
     }
 
-    fn set_seek(&self, seek: time::Duration, rewind: bool) -> Result<()> {
+    fn set_seek(
+        &self,
+        request: &comms::Request,
+        seek: time::Duration,
+        rewind: bool,
+    ) -> comms::Response {
         self.set_player_state(PlayerState::Seeking);
         let amount = if rewind {
             -seek.as_secs_f64()
@@ -181,23 +237,30 @@ impl MpvPlayer {
             seek.as_secs_f64()
         };
         match self.mpv.seek_absolute(amount) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(anyhow!("Unable to set seek: {:?}", e)),
+            Ok(_) => comms::Response::success(request),
+            Err(e) => comms::Response::error(request, e.to_string()),
         }
     }
 
-    fn play(&self) -> Result<()> {
-        self.mpv.unpause().map_err(|e| anyhow!(e.to_string()))
+    fn play(&self, request: &comms::Request) -> comms::Response {
+        match self.mpv.unpause() {
+            Ok(_) => comms::Response::success(request),
+            Err(e) => comms::Response::error(request, e.to_string()),
+        }
     }
 
-    fn pause(&self) -> Result<()> {
-        self.mpv.pause().map_err(|e| anyhow!(e.to_string()))
+    fn pause(&self, request: &comms::Request) -> comms::Response {
+        match self.mpv.pause() {
+            Ok(_) => comms::Response::success(request),
+            Err(e) => comms::Response::error(request, e.to_string()),
+        }
     }
 
-    fn stop(&self) -> Result<()> {
-        self.mpv
-            .playlist_remove_current()
-            .map_err(|e| anyhow!(e.to_string()))
+    fn stop(&self, request: &comms::Request) -> comms::Response {
+        match self.mpv.playlist_remove_current() {
+            Ok(_) => comms::Response::success(request),
+            Err(e) => comms::Response::error(request, e.to_string()),
+        }
     }
 
     // Should only be called from event handler
@@ -218,41 +281,101 @@ impl MpvPlayer {
         }
     }
 
-    fn load_video(&self, url_or_path: &str) -> Result<()> {
-        if self.mpv.playlist_clear().is_err() {
-            bail!("Unable to clear playlist")
+    fn browse(&self, request: &comms::Request) -> comms::Response {
+        let url_or_path = request.path();
+        let mut is_path = false;
+
+        if let Ok(url) = Url::parse(url_or_path) {
+            if url.scheme() == "file" {
+                is_path = true;
+            } else {
+                // TODO: browsing URL with yt-dlp?
+                return comms::Response::success(request);
+            }
+        } else {
+            is_path = true;
+        }
+
+        if is_path {
+            let path = Path::new(url_or_path);
+            if !path.exists() {
+                return comms::Response::error(request, "URL or path does not exist".to_string());
+            }
+            if path.is_file() {
+                return comms::Response::success(request)
+                    .with_payload(vec![String::from(url_or_path)]);
+            }
+            if path.is_dir() {
+                let mut playable_paths = Vec::new();
+                for entry in walkdir::WalkDir::new(path)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    let path = entry.path();
+                    if let Some(path_ext) = path.extension() {
+                        let path_ext_str = path_ext.to_str().to_owned().unwrap();
+                        if self.supported_fe.contains(path_ext_str) {
+                            playable_paths.push(path_ext_str.to_string());
+                        }
+                    }
+                }
+
+                return comms::Response::success(request).with_payload(playable_paths);
+            }
+        }
+
+        return comms::Response::error(request, "Unhandled path or url".to_string());
+    }
+
+    fn load_video(&self, request: &comms::Request) -> comms::Response {
+        let url_or_path = request.path();
+
+        if let Err(e) = self.mpv.playlist_clear() {
+            return comms::Response::error(
+                request,
+                format!("Unable to clear playlist: {:?}", e.to_string()),
+            );
         }
         if self
             .mpv
             .playlist_load_files(&[(&url_or_path, FileState::Replace, None)])
             .is_err()
         {
-            bail!("Unable to load files from {}", url_or_path)
+            return comms::Response::error(
+                request,
+                format!("Unable to load files from {}", url_or_path),
+            );
         }
 
         let mut ev_ctx = self.mpv.create_event_context();
-        if ev_ctx.disable_deprecated_events().is_err() {
-            bail!("Unable to disable deprecated events")
+        if let Err(e) = ev_ctx.disable_deprecated_events() {
+            return comms::Response::error(
+                request,
+                format!("Unable to disable deprecated events: {:?}", e),
+            );
         }
-        if ev_ctx
-            .observe_property(
-                MpvProperty::Volume.name(),
-                Format::Int64,
-                MpvProperty::Volume as u64,
-            )
-            .is_err()
-        {
-            bail!("Unable to bind volume in mpv event context")
+        if let Err(e) = ev_ctx.observe_property(
+            MpvProperty::Volume.name(),
+            Format::Int64,
+            MpvProperty::Volume as u64,
+        ) {
+            return comms::Response::error(
+                request,
+                format!("Unable to bind volume in mpv event context: {:?}", e),
+            );
         }
-        if ev_ctx
-            .observe_property(
-                MpvProperty::DemuxerCacheState.name(),
-                Format::Node,
-                MpvProperty::DemuxerCacheState as u64,
-            )
-            .is_err()
-        {
-            bail!("Unable to bind demuxer cache state in mpv event context")
+        if let Err(e) = ev_ctx.observe_property(
+            MpvProperty::DemuxerCacheState.name(),
+            Format::Node,
+            MpvProperty::DemuxerCacheState as u64,
+        ) {
+            return comms::Response::error(
+                request,
+                format!(
+                    "Unable to bind demuxer cache state in mpv event context: {:?}",
+                    e
+                ),
+            );
         }
 
         println!("Starting event loop...");
@@ -294,7 +417,7 @@ impl MpvPlayer {
         }
         println!("Event loop exited");
 
-        Ok(())
+        comms::Response::success(request)
     }
 }
 
@@ -313,16 +436,21 @@ fn seekable_ranges(demuxer_cache_state: &MpvNode) -> Option<Vec<(f64, f64)>> {
     Some(res)
 }
 
-async fn send_response(
-    stream: Arc<Mutex<TcpStream>>,
+async fn send_responses(
+    mut stream: TcpStream,
     response_rx: Arc<Mutex<async_std::channel::Receiver<comms::Response>>>,
 ) {
     let response_rx = response_rx.lock().await;
     loop {
         match response_rx.recv().await {
             Ok(response) => {
-                let encoded_data = response.encode_to_vec();
-                let mut stream = stream.lock().await;
+                let encoded_data = response.encode_length_delimited_to_vec();
+
+                println!(
+                    "Writing {} bytes to the stream: {:?}",
+                    encoded_data.len(),
+                    &encoded_data
+                );
                 if let Err(e) = stream.write_all(&encoded_data).await {
                     eprintln!("Error sending response to client: {}", e);
                     continue;
@@ -339,21 +467,19 @@ async fn send_response(
 }
 
 async fn receive_requests(
-    stream: Arc<Mutex<TcpStream>>,
+    mut stream: TcpStream,
     request_tx: async_std::channel::Sender<comms::Request>,
 ) {
     println!("New client connecting");
 
-    let mut buf_reader = BufReader::new(stream.lock().await.clone());
     let mut buf = vec![0u8; 1024];
 
     loop {
-        match buf_reader.read(&mut buf).await {
-            Ok(0) => {
-                println!("Client disconnected");
-                break;
-            }
-            Ok(n) => match comms::Request::decode(&buf[..n]) {
+        // TODO: Peek doesn't work here and allocating 1024 is not nice
+        // Ideally we peek length delimiter, allocate the rest and use a cursor
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(len) => match comms::Request::decode_length_delimited(&buf[..len]) {
                 Ok(request) => {
                     println!("Received request: {:?}", request);
                     if let Err(e) = request_tx.send(request).await {

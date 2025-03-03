@@ -2,14 +2,17 @@ use anyhow::{anyhow, Result};
 use async_std::channel::{Receiver, Sender};
 use async_std::io::{ReadExt, WriteExt};
 use async_std::net::TcpStream;
+use async_std::sync::RwLock;
 use clap::Parser;
 use comms::Message;
 use gtk::glib::clone;
 use gtk::prelude::{BoxExt, ButtonExt, GtkWindowExt, *};
-use gtk4::{self as gtk, DialogFlags};
+use gtk4::{self as gtk};
 use relm4::component::{AsyncComponent, AsyncComponentParts, AsyncComponentSender};
 use relm4::{RelmApp, RelmWidgetExt};
+use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -18,26 +21,78 @@ enum UiMessage {
     Pause,
     Stop,
     Load(String),
+    Browse(String),
     SetVolume(f64),
     SeekAbsolute(f64),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
+enum UiCommand {
+    UpdateWidgets,
+    SendInitialRequests(Args),
+}
+
+#[derive(Debug, Clone)]
 enum UiState {
     Unknown,
+    Error(String),
     Idle,
     Playing,
     Paused,
     Loading,
-    Seeking,
+}
+
+impl UiState {
+    pub fn playback_status(&self) -> mpris_server::PlaybackStatus {
+        match self {
+            UiState::Playing => mpris_server::PlaybackStatus::Playing,
+            UiState::Paused => mpris_server::PlaybackStatus::Paused,
+            _ => mpris_server::PlaybackStatus::Stopped,
+        }
+    }
+
+    pub fn can_play(&self) -> bool {
+        match self {
+            UiState::Paused | UiState::Idle => true,
+            UiState::Playing | UiState::Error(_) | UiState::Loading | UiState::Unknown => false,
+        }
+    }
+
+    pub fn can_pause(&self) -> bool {
+        match self {
+            UiState::Playing => true,
+            _ => false,
+        }
+    }
+
+    pub fn can_stop(&self) -> bool {
+        match self {
+            UiState::Playing | UiState::Paused => true,
+            _ => false,
+        }
+    }
+
+    pub fn can_seek(&self) -> bool {
+        match self {
+            UiState::Playing | UiState::Paused | UiState::Loading => true,
+            _ => false,
+        }
+    }
+}
+
+struct MediaState {
+    title: String,
+    length: std::time::Duration,
+    current: std::time::Duration,
 }
 
 struct App {
-    mpris: Option<mpris_server::Player>,
+    mpris: mpris_server::Player,
     state: UiState,
+    media: Option<MediaState>,
     request_tx: async_std::channel::Sender<comms::Request>,
     request_id: std::sync::atomic::AtomicU32,
-    response_rx: async_std::channel::Receiver<comms::Response>,
+    response_rx: async_std::channel::Receiver<(comms::Request, comms::Response)>,
 }
 
 #[derive(Parser, Debug)]
@@ -81,8 +136,26 @@ impl AppWidgets {
         self.window.set_sensitive(true);
     }
 
-    pub fn set_status(&self, status: UiState) {
-        self.status_label.set_label(&format!("{:#?}", status));
+    pub fn set_status(&self, state: &UiState) {
+        let status = match state {
+            UiState::Error(err) => err,
+            _ => &format!("{:#?}", state),
+        };
+
+        self.status_label.set_label(status);
+    }
+
+    pub fn set_media_state(&self, media: Option<&MediaState>) {
+        if let Some(media) = media {
+            self.time_label.set_label(&format!("{:?}", media.current));
+            self.end_label.set_label(&format!("{:?}", media.length));
+            self.window
+                .set_title(Some(&format!("Casting {}", media.title)));
+        } else {
+            self.time_label.set_label("00:00:00");
+            self.end_label.set_label("00:00:00");
+            self.window.set_title(Some("MpvCast"));
+        }
     }
 }
 
@@ -90,7 +163,7 @@ impl AsyncComponent for App {
     type Init = Args;
     type Input = UiMessage;
     type Output = ();
-    type CommandOutput = ();
+    type CommandOutput = UiCommand;
     type Widgets = AppWidgets;
     type Root = gtk::Window;
 
@@ -178,12 +251,13 @@ impl AsyncComponent for App {
                 sender.input(UiMessage::SetVolume(0.));
             }
         ));
+        let source_cloned = args.source.clone();
         load_button.connect_clicked(clone!(
             #[strong]
             sender,
             move |_| {
                 sender.input(UiMessage::Load(
-                    args.source.clone().unwrap_or("?".to_string()),
+                    source_cloned.clone().unwrap_or("?".to_string()),
                 ));
             }
         ));
@@ -206,16 +280,6 @@ impl AsyncComponent for App {
 
         println!("Init: creating app");
         let model = App::new().await;
-        if model.mpris.is_none() {
-            let emsg = gtk::MessageDialog::new(
-                Some(&window),
-                DialogFlags::empty(),
-                gtk4::MessageType::Error,
-                gtk4::ButtonsType::Ok,
-                "Unable to initialize MPRIS Server. Check that you are running something with dbus",
-            );
-            emsg.show();
-        }
 
         let widgets = AppWidgets {
             window,
@@ -230,9 +294,18 @@ impl AsyncComponent for App {
             end_label,
             status_label,
         };
+        sender.command(|out, shutdown| {
+            shutdown
+                .register(async move { out.send(UiCommand::UpdateWidgets).unwrap() })
+                .drop_on_shutdown()
+        });
+        sender.command(|out, shutdown| {
+            shutdown
+                .register(async move { out.send(UiCommand::SendInitialRequests(args)).unwrap() })
+                .drop_on_shutdown()
+        });
 
         println!("Initialized view");
-
         AsyncComponentParts { model, widgets }
     }
 
@@ -247,6 +320,7 @@ impl AsyncComponent for App {
             UiMessage::Pause => comms::Request::pause(self.next_request_id()),
             UiMessage::Stop => comms::Request::stop(self.next_request_id()),
             UiMessage::Load(path) => comms::Request::load(self.next_request_id(), path),
+            UiMessage::Browse(path) => comms::Request::browse(self.next_request_id(), path),
             UiMessage::SetVolume(volume) => {
                 comms::Request::volume(self.next_request_id(), (volume * 100.) as i64)
             }
@@ -260,10 +334,106 @@ impl AsyncComponent for App {
         if let Err(e) = self.queue_request(request).await {
             eprintln!("{}", e);
         }
+
+        // Wait for response to be processed
+        let pair = match self.response_rx.recv().await {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                self.state = UiState::Error(e.to_string());
+                None
+            }
+        };
+        if let Some(pair) = pair {
+            self.handle_comms_pair(pair).await;
+        }
     }
 
-    fn update_view(&self, widgets: &mut Self::Widgets, _sender: AsyncComponentSender<Self>) {
-        widgets.set_status(self.state);
+    async fn update_cmd_with_view(
+        &mut self,
+        widgets: &mut Self::Widgets,
+        message: Self::CommandOutput,
+        sender: AsyncComponentSender<Self>,
+        _root: &Self::Root,
+    ) -> () {
+        let state = &self.state;
+        widgets.set_status(state);
+        widgets.set_media_state(self.media.as_ref());
+
+        match state {
+            UiState::Loading | UiState::Unknown | UiState::Error(_) => widgets.disable(),
+            _ => widgets.enable(),
+        }
+
+        match message {
+            UiCommand::UpdateWidgets => {
+                println!("UpdateWidgets");
+
+                widgets.play_button.set_visible(false);
+                widgets.pause_button.set_visible(false);
+                widgets.stop_button.set_visible(false);
+                widgets.mute_button.set_visible(false);
+                widgets.volume_slider.set_visible(false);
+                widgets.seek_slider.set_visible(false);
+                widgets.load_button.set_visible(false);
+
+                // mpris
+                let mpris = &self.mpris;
+                if let Err(e) = mpris.set_playback_status(state.playback_status()).await {
+                    eprintln!("{}", e);
+                }
+
+                let can_play = state.can_play();
+                widgets.play_button.set_visible(can_play);
+                if let Err(e) = mpris.set_can_play(can_play).await {
+                    eprintln!("{}", e);
+                }
+
+                let can_pause = state.can_pause();
+                widgets.pause_button.set_visible(can_pause);
+                if let Err(e) = mpris.set_can_pause(can_pause).await {
+                    eprintln!("{}", e);
+                }
+
+                let can_stop = state.can_stop();
+                widgets.stop_button.set_visible(can_stop);
+                if let Err(e) = mpris.set_can_quit(can_stop).await {
+                    eprintln!("{}", e);
+                }
+
+                let can_seek = state.can_seek();
+                widgets.seek_slider.set_visible(can_seek);
+                if let Err(e) = mpris.set_can_seek(can_seek).await {
+                    eprintln!("{}", e);
+                }
+            }
+            UiCommand::SendInitialRequests(args) => {
+                println!("SendInitialRequestArgs: {:?}", &args);
+
+                if let Some(initial_source) = args.source {
+                    let initial_load = UiMessage::Load(initial_source);
+                    if let Err(e) = sender.input_sender().send(initial_load) {
+                        eprintln!("Error sending initial source request: {:?}", e);
+                    }
+                } else {
+                    let initial_browse = UiMessage::Browse("~/Videos".to_string());
+                    if let Err(e) = sender.input_sender().send(initial_browse) {
+                        eprintln!("error sending initial browse request: {:?}", e);
+                    }
+                }
+                if let Some(initial_volume) = args.volume {
+                    println!("Sending initial source: {:?}", &initial_volume);
+                    sender
+                        .input_sender()
+                        .emit(UiMessage::SetVolume(initial_volume as f64 / 100.));
+                }
+                if let Some(initial_seek) = args.at {
+                    println!("Sending initial seek: {:?}", &initial_seek);
+                    sender
+                        .input_sender()
+                        .emit(UiMessage::SeekAbsolute(initial_seek.as_secs_f64()));
+                }
+            }
+        }
     }
 }
 
@@ -280,25 +450,27 @@ impl App {
             .can_set_fullscreen(true)
             .can_control(true)
             .build()
-            .await;
+            .await
+            .unwrap();
 
-        let mpris = match mpris {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("Error initializing MPRIS: {:?}", e);
-                None
-            }
-        };
         let (request_tx, request_rx) = async_std::channel::unbounded::<comms::Request>();
-        let (response_tx, response_rx) = async_std::channel::unbounded::<comms::Response>();
+        let (response_tx, response_rx) =
+            async_std::channel::unbounded::<(comms::Request, comms::Response)>();
 
         println!("Spawning connection task");
-        async_std::task::spawn(start_comms("0.0.0.0:8008", request_rx, response_tx));
+        async_std::task::spawn(start_comms(
+            "0.0.0.0:8008",
+            Arc::new(request_rx),
+            response_tx,
+        ));
+
+        async_std::task::spawn_local(mpris.run());
 
         Self {
             mpris,
             request_tx,
             response_rx,
+            media: None,
             state: UiState::Unknown,
             request_id: std::sync::atomic::AtomicU32::new(0),
         }
@@ -317,78 +489,115 @@ impl App {
             Err(e) => Err(anyhow!(e.to_string())),
         }
     }
+
+    async fn handle_comms_pair(&mut self, pair: (comms::Request, comms::Response)) {
+        println!("handle_comms_pair: {:#?}", pair);
+    }
 }
 
-async fn send_requests(mut con: TcpStream, request_rx: Receiver<comms::Request>) {
-    let mut buf = vec![0u8; 1024];
+async fn receive_responses(
+    mut con: TcpStream,
+    pending_requests: Arc<RwLock<HashMap<u32, comms::Request>>>,
+    response_tx: Sender<(comms::Request, comms::Response)>,
+) {
+    let mut len_buf = [0u8; 10];
+
     loop {
-        // Try reading any new requests to send from our UI
-        match request_rx.try_recv() {
-            Ok(request) => {
-                if let Err(e) = request.encode(&mut buf) {
-                    eprintln!("Error encoding request to bytes: {:?}", e);
-                    break;
-                }
-                if let Err(e) = con.write_all(&buf).await {
-                    eprintln!("Error writing request to tcp: {:?}", e);
-                    break;
-                }
-            }
-            Err(async_std::channel::TryRecvError::Empty) => (),
-            Err(e) => {
-                eprintln!("Error receiving request: {:?}", e);
+        println!("Waiting on responses...");
+        if let Ok(n) = con.peek(&mut len_buf).await {
+            if n == 0 {
+                println!("No data, exiting receive loop");
                 break;
             }
+        } else {
+            eprintln!("Unable to read bytes in stream");
+            break;
+        }
+        if let Ok(len) = comms::decode_length_delimiter(&len_buf[..]) {
+            let mut buf = vec![0u8; len];
+            if let Err(e) = con.read_exact(&mut buf).await {
+                eprintln!("Error reading {} bytes from stream: {}", len, e);
+                break;
+            }
+            match comms::Response::decode(&buf[..]) {
+                Ok(response) => {
+                    let id = response.request_id;
+                    let status = response.status().as_str_name();
+                    println!(
+                        "Received response from server: id = {}, status = {}",
+                        id, status
+                    );
+
+                    let mut pending = pending_requests.write().await;
+                    if let Some(request) = pending.remove(&id) {
+                        println!("Response matched request: {:?}", &request);
+
+                        if response_tx.send((request, response)).await.is_err() {
+                            eprintln!(
+                                "Failed to send response to channel, dropped: id = {}, status = {}",
+                                id, status
+                            );
+                            break;
+                        }
+                    } else {
+                        eprintln!("Response did not match pending request: {:?}", &response);
+                    }
+                }
+                Err(e) => {
+                    eprint!("Failed to decode response bytes: {:?}", e);
+                    continue;
+                }
+            }
+        } else {
+            eprintln!("Failed to decode length delimiter in request stream");
         }
     }
 }
 
-async fn receive_responses(mut con: TcpStream, response_tx: Sender<comms::Response>) {
-    let mut reader = async_std::io::BufReader::new(&con);
-    let mut buf = [0u8; 1024];
-
-    while let Ok(n) = reader.read(&mut buf).await {
-        if n == 0 {
+async fn send_requests(
+    mut con: TcpStream,
+    pending_requests: Arc<RwLock<HashMap<u32, comms::Request>>>,
+    request_rx: Arc<async_std::channel::Receiver<comms::Request>>,
+) {
+    while let Ok(request) = request_rx.recv().await {
+        let buf = request.encode_length_delimited_to_vec();
+        if let Err(e) = con.write_all(&buf).await {
+            eprintln!("Error writing request to tcp: {:?}", e);
             break;
         }
-        match comms::Response::decode(&buf[..n]) {
-            Ok(response) => {
-                let id = response.request_id;
-                let status = response.status().as_str_name();
-                if response_tx.send(response).await.is_err() {
-                    eprintln!(
-                        "Failed to send response to channel, dropped: id = {}, status = {}",
-                        id, status
-                    );
-                    break;
-                }
-            }
-            Err(e) => {
-                eprint!("Failed to decode response bytes: {:?}", e);
-                continue;
-            }
-        }
+        println!("Wrote request of {} bytes to stream: {:?}", buf.len(), &buf);
+
+        let mut pending = pending_requests.write().await;
+        pending.insert(request.id, request);
     }
 }
 
 async fn start_comms(
     addr: &str,
-    request_rx: Receiver<comms::Request>,
-    response_tx: Sender<comms::Response>,
+    request_rx: Arc<Receiver<comms::Request>>,
+    response_tx: Sender<(comms::Request, comms::Response)>,
 ) {
+    let pending_requests = Arc::new(RwLock::new(HashMap::<u32, comms::Request>::new()));
     loop {
         let con = match connect_with_retries(addr).await {
             Some(con) => con,
             None => continue,
         };
 
-        let con_clone = con.clone();
-        let send_task = async_std::task::spawn(send_requests(con, request_rx.clone()));
-        let recv_task = async_std::task::spawn(receive_responses(con_clone, response_tx.clone()));
+        let send_task = async_std::task::spawn(send_requests(
+            con.clone(),
+            pending_requests.clone(),
+            request_rx.clone(),
+        ));
+        let recv_task = async_std::task::spawn(receive_responses(
+            con.clone(),
+            pending_requests.clone(),
+            response_tx.clone(),
+        ));
 
         // Wait for either to fail
-        send_task.await;
         recv_task.await;
+        send_task.await;
 
         println!("Connection lost. Reconnecting...");
     }

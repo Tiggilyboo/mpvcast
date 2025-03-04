@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use async_std::channel::{Receiver, Sender};
-use async_std::io::{ReadExt, WriteExt};
+use async_std::io::prelude::*;
+use async_std::io::BufReader;
 use async_std::net::TcpStream;
 use async_std::sync::RwLock;
 use clap::Parser;
@@ -30,9 +31,10 @@ enum UiMessage {
 enum UiCommand {
     UpdateWidgets,
     SendInitialRequests(Args),
+    StateChanged(UiState),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum UiState {
     Unknown,
     Error(String),
@@ -312,7 +314,7 @@ impl AsyncComponent for App {
     async fn update(
         &mut self,
         message: Self::Input,
-        _sender: AsyncComponentSender<Self>,
+        sender: AsyncComponentSender<Self>,
         _root: &Self::Root,
     ) {
         let request = match message {
@@ -344,7 +346,7 @@ impl AsyncComponent for App {
             }
         };
         if let Some(pair) = pair {
-            self.handle_comms_pair(pair).await;
+            self.handle_comms_pair(sender, pair).await;
         }
     }
 
@@ -365,6 +367,13 @@ impl AsyncComponent for App {
         }
 
         match message {
+            UiCommand::StateChanged(new_state) => {
+                self.state = new_state;
+                sender
+                    .command_sender()
+                    .send(UiCommand::UpdateWidgets)
+                    .unwrap();
+            }
             UiCommand::UpdateWidgets => {
                 println!("UpdateWidgets");
 
@@ -490,8 +499,51 @@ impl App {
         }
     }
 
-    async fn handle_comms_pair(&mut self, pair: (comms::Request, comms::Response)) {
+    async fn handle_comms_pair(
+        &mut self,
+        sender: AsyncComponentSender<Self>,
+        pair: (comms::Request, comms::Response),
+    ) {
         println!("handle_comms_pair: {:#?}", pair);
+
+        let (request, response) = pair;
+        match response.status() {
+            comms::Status::Failure | comms::Status::Error => {
+                if let Some(message) = response.payload.get(0) {
+                    sender
+                        .command_sender()
+                        .send(UiCommand::StateChanged(UiState::Error(message.to_string())))
+                        .unwrap();
+                } else {
+                    sender
+                        .command_sender()
+                        .send(UiCommand::StateChanged(UiState::Error(format!(
+                            "{:?} {:?}",
+                            response.status(),
+                            request.action()
+                        ))))
+                        .unwrap();
+                }
+                return;
+            }
+            comms::Status::Success => {
+                let new_state = match request.action() {
+                    comms::Action::Stop => Some(UiState::Idle),
+                    comms::Action::Pause => Some(UiState::Paused),
+                    comms::Action::Start => Some(UiState::Playing),
+                    comms::Action::Load => Some(UiState::Idle),
+                    comms::Action::Browse => Some(UiState::Idle), // TODO
+                    comms::Action::Seek => Some(UiState::Loading),
+                    comms::Action::Volume => None,
+                };
+                if let Some(new_state) = new_state {
+                    sender
+                        .command_sender()
+                        .send(UiCommand::StateChanged(new_state))
+                        .unwrap();
+                }
+            }
+        }
     }
 }
 
@@ -500,26 +552,39 @@ async fn receive_responses(
     pending_requests: Arc<RwLock<HashMap<u32, comms::Request>>>,
     response_tx: Sender<(comms::Request, comms::Response)>,
 ) {
+    let mut reader = BufReader::new(&mut con);
     let mut len_buf = [0u8; 10];
 
     loop {
         println!("Waiting on responses...");
-        if let Ok(n) = con.peek(&mut len_buf).await {
-            if n == 0 {
-                println!("No data, exiting receive loop");
-                break;
+        match reader.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                println!("Connection closed, EOF reached");
+                return;
             }
-        } else {
-            eprintln!("Unable to read bytes in stream");
-            break;
+            Err(e) => {
+                eprintln!("Error reading length delim: {}", e);
+                return;
+            }
         }
-        if let Ok(len) = comms::decode_length_delimiter(&len_buf[..]) {
-            let mut buf = vec![0u8; len];
-            if let Err(e) = con.read_exact(&mut buf).await {
-                eprintln!("Error reading {} bytes from stream: {}", len, e);
+        println!("Read {:?} in stream", &len_buf);
+
+        if let Ok(len_delim) = comms::decode_length_delimiter(&len_buf[..]) {
+            println!("Got decoded length delim: {}", len_delim);
+            let len_delim_len = comms::length_delimiter_len(len_delim);
+            println!("length delim len: {}", len_delim_len);
+
+            let mut buf = vec![0u8; len_delim + len_delim_len];
+            buf[..len_buf.len()].copy_from_slice(&len_buf[..]);
+
+            if let Err(e) = reader.read_exact(&mut buf[len_buf.len()..]).await {
+                eprintln!("Error reading {} bytes from stream: {}", len_delim, e);
                 break;
             }
-            match comms::Response::decode(&buf[..]) {
+            println!("buf = {:?}", &buf);
+
+            match comms::Response::decode_length_delimited(&buf[..]) {
                 Ok(response) => {
                     let id = response.request_id;
                     let status = response.status().as_str_name();
@@ -559,16 +624,20 @@ async fn send_requests(
     pending_requests: Arc<RwLock<HashMap<u32, comms::Request>>>,
     request_rx: Arc<async_std::channel::Receiver<comms::Request>>,
 ) {
-    while let Ok(request) = request_rx.recv().await {
-        let buf = request.encode_length_delimited_to_vec();
-        if let Err(e) = con.write_all(&buf).await {
-            eprintln!("Error writing request to tcp: {:?}", e);
-            break;
-        }
-        println!("Wrote request of {} bytes to stream: {:?}", buf.len(), &buf);
+    loop {
+        while let Ok(request) = request_rx.recv().await {
+            let buf = request.encode_length_delimited_to_vec();
+            if let Err(e) = con.write_all(&buf).await {
+                eprintln!("Error writing request to tcp: {:?}", e);
+                break;
+            }
+            println!("Wrote request of {} bytes to stream: {:?}", buf.len(), &buf);
 
-        let mut pending = pending_requests.write().await;
-        pending.insert(request.id, request);
+            let mut pending = pending_requests.write().await;
+            pending.insert(request.id, request);
+        }
+
+        async_std::task::sleep(Duration::from_millis(1)).await;
     }
 }
 

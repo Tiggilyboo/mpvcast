@@ -10,5 +10,5 @@ mpris-server = "0.8"
 relm4 = "0.9"
 relm4-components = "0.9"
 gtk4 = "0.9"
-async-std = {version = "1.13", features = ["std", "attributes", "unstable"] }
+async-std = {version = "1.13", features = ["std", "default", "unstable", "attributes", "async-io"] }
 clap = { version = "4.5", features = ["derive"] }
